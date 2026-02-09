@@ -1,0 +1,18 @@
+[project]
+name = "audiobook-api"
+version = "0.1.0"
+description = "ePub/PDF/DOCX/TXT to audiobook conversion API using Qwen3-TTS"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "httpx",
+    "ebooklib",
+    "beautifulsoup4",
+    "pypdf",
+    "python-docx",
+    "pydub",
+    "mutagen",
+    "aiosqlite",
+]
