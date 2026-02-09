@@ -9,22 +9,23 @@ Converts ebooks into **M4B audiobooks** (with chapter markers, cover art, and sy
 ```
 ┌─────────────┐      ┌──────────────────┐      ┌─────────────────┐
 │  Client      │      │  audiobook-api   │      │  qwen3-tts      │
-│  (curl/app)  │─────▶│  :8766           │─────▶│  :8765          │
+│  (curl/app)  │─────▶│  :8767           │─────▶│  :8765          │
 │              │◀─────│  Job queue +     │◀─────│  TTS generation │
 └─────────────┘      │  orchestration   │      └─────────────────┘
-                      └────────┬─────────┘
-                               │
-                          ┌────▼─────┐
-                          │  ffmpeg  │
-                          │  M4B/MP3 │
-                          │  assembly│
-                          └──────────┘
+                      └──┬─────────┬────┘
+                         │         │
+                    ┌────▼───┐ ┌───▼──────────┐
+                    │ ffmpeg │ │ whisper-stt   │
+                    │ M4B/MP3│ │ :8766         │
+                    │ encode │ │ auto-transcr. │
+                    └────────┘ └──────────────┘
 ```
 
 - **Async job queue**: Upload a file, get a job ID, poll for progress
 - **MD5 chunk caching**: Resume failed jobs without re-generating completed chunks
-- **~1200-word chunks**: Sentence-boundary splitting for natural prosody
+- **~300-word chunks**: Sentence-boundary splitting (conservative for MPS fp32 voice cloning)
 - **Preset voices** (Aiden, Vivian, etc.) or **voice cloning** from a reference WAV
+- **Auto-transcription**: Reference audio automatically transcribed via Whisper STT (no manual `ref_text` needed)
 
 ## Requirements
 
@@ -32,6 +33,7 @@ Converts ebooks into **M4B audiobooks** (with chapter markers, cover art, and sy
 - [uv](https://docs.astral.sh/uv/) package manager
 - [ffmpeg](https://ffmpeg.org/) (for audio encoding)
 - Running [Qwen3-TTS server](../qwen3-tts) on port 8765
+- Running [Whisper STT server](../whisper-stt) on port 8766 (required for voice cloning)
 
 ## Quick Start
 
@@ -39,7 +41,7 @@ Converts ebooks into **M4B audiobooks** (with chapter markers, cover art, and sy
 # Install dependencies
 uv sync
 
-# Start the server (requires qwen3-tts running on :8765)
+# Start the server (requires qwen3-tts on :8765, whisper-stt on :8766 for cloning)
 uv run python server.py
 ```
 
@@ -51,7 +53,8 @@ uv run python server.py
 | `GET /jobs` | — | List all jobs |
 | `GET /jobs/{id}` | — | Job status + progress |
 | `GET /jobs/{id}/download` | — | Download completed audiobook |
-| `DELETE /jobs/{id}` | — | Cancel / cleanup |
+| `POST /jobs/{id}/cancel` | — | Cancel a running job (keeps cached chunks) |
+| `DELETE /jobs/{id}` | — | Delete job + cleanup all files |
 | `GET /health` | — | Service + TTS health check |
 
 ### `POST /convert`
@@ -64,13 +67,13 @@ Multipart form fields:
 | `voice` | string | `"Aiden"` | Preset voice name |
 | `language` | string | `"English"` | `"English"` or `"French"` |
 | `format` | string | `"m4b"` | `"m4b"` or `"mp3"` |
-| `ref_audio` | file | — | Reference WAV for voice cloning (overrides `voice`) |
+| `ref_audio` | file | — | Reference WAV for voice cloning (auto-transcribed via Whisper STT) |
 
 ### Examples
 
 **Convert with preset voice:**
 ```bash
-curl -X POST http://localhost:8766/convert \
+curl -X POST http://localhost:8767/convert \
   -F "file=@book.epub" \
   -F "voice=Aiden" \
   -F "format=m4b"
@@ -78,15 +81,17 @@ curl -X POST http://localhost:8766/convert \
 
 **Convert with voice cloning:**
 ```bash
-curl -X POST http://localhost:8766/convert \
+curl -X POST http://localhost:8767/convert \
   -F "file=@book.epub" \
   -F "ref_audio=@narrator-sample.wav" \
   -F "format=m4b"
 ```
 
+The reference audio is automatically transcribed by the Whisper STT server — no manual transcript needed.
+
 **Check progress:**
 ```bash
-curl http://localhost:8766/jobs/abc123def456
+curl http://localhost:8767/jobs/abc123def456
 ```
 
 ```json
@@ -107,9 +112,16 @@ curl http://localhost:8766/jobs/abc123def456
 }
 ```
 
+**Cancel a running job:**
+```bash
+curl -X POST http://localhost:8767/jobs/abc123def456/cancel
+```
+
+Cached chunks are preserved — re-submitting the same book will skip already-generated chunks.
+
 **Download result:**
 ```bash
-curl -o audiobook.m4b http://localhost:8766/jobs/abc123def456/download
+curl -o audiobook.m4b http://localhost:8767/jobs/abc123def456/download
 ```
 
 ## Output Features
@@ -129,11 +141,25 @@ curl -o audiobook.m4b http://localhost:8766/jobs/abc123def456/download
 
 ## Processing Estimates (M3 Max, 48 GB)
 
-| Book size | Chunks | Audio length | Processing time |
-|-----------|--------|-------------|-----------------|
-| Short (30K words) | ~25 | ~3.3 hrs | ~1.7 hrs |
-| Medium (80K words) | ~67 | ~8.9 hrs | ~4.5 hrs |
-| Long (120K words) | ~100 | ~13.3 hrs | ~6.7 hrs |
+Chunk sizes are tuned for MPS fp32 memory constraints: ~300 words per chunk.
+
+### Preset Voice
+
+| Book size | Chunks | Est. processing time |
+|-----------|--------|---------------------|
+| Short (30K words) | ~100 | ~3 hrs |
+| Medium (80K words) | ~270 | ~8 hrs |
+| Long (120K words) | ~400 | ~12 hrs |
+
+### Voice Cloning
+
+Voice cloning is ~3x slower than preset voices due to ICL reference processing:
+
+| Book size | Chunks | Est. processing time |
+|-----------|--------|---------------------|
+| Short (30K words) | ~100 | ~8 hrs |
+| Medium (80K words) | ~270 | ~22 hrs |
+| Long (120K words) | ~400 | ~33 hrs |
 
 Cached chunks are skipped on retry, so restarting a failed job is fast.
 
@@ -141,14 +167,14 @@ Cached chunks are skipped on retry, so restarting a failed job is fast.
 
 ```
 audiobook-api/
-├── server.py         # FastAPI app, routes, IP middleware
-├── extractor.py      # ePub/PDF/DOCX/TXT → chapters + cover art
-├── chunker.py        # Chapter text → ~1200-word chunks
-├── tts_client.py     # Async HTTP client for Qwen3-TTS
+├── server.py         # FastAPI app on :8767, routes, IP middleware
+├── extractor.py      # ePub/PDF/DOCX/TXT → chapters + cover art + metadata
+├── chunker.py        # Chapter text → ~300-word sentence-boundary chunks
+├── tts_client.py     # Async HTTP client for Qwen3-TTS + Whisper STT
 ├── sync_text.py      # LRC lyrics from chunk timing data
 ├── assembler.py      # WAV → M4B/MP3 via pydub + ffmpeg + mutagen
-├── converter.py      # Pipeline orchestrator with caching
-├── jobs.py           # SQLite job store
+├── converter.py      # Pipeline orchestrator with MD5 caching
+├── jobs.py           # Async SQLite job store
 ├── pyproject.toml    # Dependencies (uv)
 └── data/             # Runtime (gitignored)
     ├── uploads/      # Uploaded source files
@@ -158,7 +184,7 @@ audiobook-api/
 
 ## Network Security
 
-Access restricted to localhost (`127.0.0.0/8`) and Tailscale (`100.64.0.0/10`) via IP allowlist middleware — same policy as the TTS server.
+Access restricted to localhost (`127.0.0.0/8`) and Tailscale (`100.64.0.0/10`) via IP allowlist middleware — same policy as the TTS and STT servers.
 
 ## Available Voices
 

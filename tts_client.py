@@ -9,12 +9,15 @@ import httpx
 logger = logging.getLogger("audiobook-api.tts")
 
 TTS_BASE_URL = "http://127.0.0.1:8765"
+STT_BASE_URL = "http://127.0.0.1:8766"
 REQUEST_TIMEOUT = 600.0  # 10 min for long-form chunks
 MAX_RETRIES = 3
 BACKOFF_SECS = [5, 10, 20]
 
-# ~1200 words ≈ 8 min audio ≈ 5760 tokens at 12Hz codec
-AUDIOBOOK_MAX_TOKENS = 5760
+# ~300 words ≈ 2 min audio ≈ 1440 tokens at 12Hz codec
+# Conservative for MPS fp32 voice cloning; preset voices can handle more
+AUDIOBOOK_MAX_TOKENS_CLONE = 1440
+AUDIOBOOK_MAX_TOKENS_PRESET = 3600  # ~5 min audio
 
 
 class TTSClient:
@@ -69,7 +72,7 @@ class TTSClient:
         text: str,
         voice: str = "Aiden",
         language: str = "English",
-        max_new_tokens: int = AUDIOBOOK_MAX_TOKENS,
+        max_new_tokens: int = AUDIOBOOK_MAX_TOKENS_PRESET,
     ) -> bytes:
         """Generate TTS audio using a preset voice. Returns WAV bytes."""
         resp = await self._request_with_retry(
@@ -89,20 +92,35 @@ class TTSClient:
         text: str,
         ref_audio_b64: str,
         language: str = "English",
-        max_new_tokens: int = AUDIOBOOK_MAX_TOKENS,
+        max_new_tokens: int = AUDIOBOOK_MAX_TOKENS_CLONE,
+        ref_text: str | None = None,
     ) -> bytes:
         """Generate TTS audio using voice cloning. Returns WAV bytes."""
+        payload: dict = {
+            "text": text,
+            "ref_audio": ref_audio_b64,
+            "language": language,
+            "max_new_tokens": max_new_tokens,
+        }
+        if ref_text:
+            payload["ref_text"] = ref_text
         resp = await self._request_with_retry(
             "POST",
             "/tts/clone",
-            json={
-                "text": text,
-                "ref_audio": ref_audio_b64,
-                "language": language,
-                "max_new_tokens": max_new_tokens,
-            },
+            json=payload,
         )
         return resp.content
+
+    async def transcribe(self, audio_bytes: bytes, filename: str = "audio.wav") -> str:
+        """Transcribe audio via Whisper STT server. Returns transcript text."""
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as stt:
+            resp = await stt.post(
+                f"{STT_BASE_URL}/v1/audio/transcriptions",
+                files={"file": (filename, audio_bytes, "audio/wav")},
+                data={"model": "large-v3-turbo"},
+            )
+            resp.raise_for_status()
+            return resp.json()["text"]
 
     async def health_check(self) -> dict:
         """Check TTS server health."""

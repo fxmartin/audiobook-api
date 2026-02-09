@@ -5,8 +5,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-TARGET_WORDS = 1200
-MAX_WORDS = 1500  # Hard ceiling before forcing a split
+TARGET_WORDS = 300   # Conservative for MPS fp32 voice cloning
+MAX_WORDS = 400      # Hard ceiling before forcing a split
 
 # Sentence boundary: after .!? followed by whitespace
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")

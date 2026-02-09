@@ -62,7 +62,12 @@ def extract(file_path: Path) -> ExtractionResult:
 
 
 def _extract_epub(file_path: Path) -> ExtractionResult:
-    """Extract from ePub using ebooklib + BeautifulSoup."""
+    """Extract from ePub using ebooklib + BeautifulSoup.
+
+    Uses TOC entries to define chapter boundaries, merging all HTML documents
+    between consecutive TOC entries into a single chapter. Skips front/back matter
+    (dedication, contents, notes, index, copyright, etc.).
+    """
     import ebooklib
     from bs4 import BeautifulSoup
     from ebooklib import epub
@@ -80,13 +85,13 @@ def _extract_epub(file_path: Path) -> ExtractionResult:
     meta.year = date_raw[:4] if date_raw else ""
     meta.description = _get("DC", "description") or ""
 
-    # Cover art
+    # Cover art — 3 strategies
     cover_image = None
     # Method 1: ITEM_COVER type
     for item in book.get_items_of_type(ebooklib.ITEM_COVER):
         cover_image = item.get_content()
         break
-    # Method 2: OPF metadata pointing to an image
+    # Method 2: OPF metadata pointing to an image by ID
     if cover_image is None:
         cover_meta = book.get_metadata("OPF", "cover")
         if cover_meta:
@@ -96,46 +101,92 @@ def _extract_epub(file_path: Path) -> ExtractionResult:
                     if item.get_id() == cover_id:
                         cover_image = item.get_content()
                         break
+    # Method 3: Image with id or filename containing "cover"
+    if cover_image is None:
+        for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
+            item_id = (item.get_id() or "").lower()
+            item_name = (item.get_name() or "").lower()
+            if "cover" in item_id or "cover" in item_name:
+                cover_image = item.get_content()
+                break
 
-    # Build TOC title map from NCX/nav
-    toc_titles = {}
+    # Build ordered list of all document file names
+    all_docs: dict[str, bytes] = {}
+    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        fname = (getattr(item, "file_name", "") or item.get_name() or "").split("/")[-1]
+        all_docs[fname] = item.get_content()
+
+    # Build TOC entries as (href_base, title) in order
+    toc_entries: list[tuple[str, str]] = []
     def _walk_toc(toc_items):
         for item in toc_items:
             if isinstance(item, tuple):
-                # (Section, children)
-                _walk_toc(item[1])
+                section, children = item
+                if hasattr(section, "href"):
+                    href_base = section.href.split("#")[0].split("/")[-1]
+                    toc_entries.append((href_base, section.title))
+                _walk_toc(children)
             elif hasattr(item, "href") and hasattr(item, "title"):
-                href_base = item.href.split("#")[0]
-                toc_titles[href_base] = item.title
+                href_base = item.href.split("#")[0].split("/")[-1]
+                toc_entries.append((href_base, item.title))
     _walk_toc(book.toc)
 
-    # Extract chapters from spine
+    # Skip front/back matter TOC entries
+    SKIP_TITLES = {"title page", "dedication", "contents", "copyright",
+                   "about the publisher", "about the authors", "about the author",
+                   "notes", "index", "also by"}
+
+    # Build chapter boundaries: map each TOC entry to a range of doc filenames
+    doc_names = list(all_docs.keys())
     chapters = []
-    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-        soup = BeautifulSoup(item.get_content(), "html.parser")
-        text = soup.get_text(separator="\n")
-        text = _clean_text(text)
 
-        if not text or len(text) < 50:
+    # Find which TOC entries are real chapters (filter junk)
+    chapter_toc: list[tuple[str, str]] = []
+    for href, title in toc_entries:
+        if title.lower().strip() in SKIP_TITLES:
             continue
+        chapter_toc.append((href, title))
 
-        # Determine chapter title
-        href = getattr(item, "file_name", "") or ""
-        title = toc_titles.get(href.split("/")[-1], "")
-        if not title:
-            # Fallback: first h1/h2
-            heading = soup.find(["h1", "h2"])
-            title = heading.get_text(strip=True) if heading else ""
-        if not title:
-            title = f"Chapter {len(chapters) + 1}"
+    if chapter_toc:
+        # For each TOC chapter, collect all docs from its start href to the next chapter's start
+        for i, (href, title) in enumerate(chapter_toc):
+            # Find start index in doc list
+            start_idx = None
+            for idx, name in enumerate(doc_names):
+                if name == href:
+                    start_idx = idx
+                    break
+            if start_idx is None:
+                continue
 
-        chapters.append(Chapter(title=title, text=text))
+            # Find end: start of next chapter, or end of doc list
+            end_idx = len(doc_names)
+            if i + 1 < len(chapter_toc):
+                next_href = chapter_toc[i + 1][0]
+                for idx, name in enumerate(doc_names):
+                    if name == next_href:
+                        end_idx = idx
+                        break
+
+            # Merge all docs in this range
+            texts = []
+            for idx in range(start_idx, end_idx):
+                content = all_docs[doc_names[idx]]
+                soup = BeautifulSoup(content, "html.parser")
+                text = soup.get_text(separator="\n")
+                text = _clean_text(text)
+                if text:
+                    texts.append(text)
+
+            combined = "\n\n".join(texts)
+            if combined and len(combined.split()) > 30:
+                chapters.append(Chapter(title=title, text=combined))
 
     if not chapters:
         # Fallback: concatenate everything as one chapter
         all_text = []
-        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-            soup = BeautifulSoup(item.get_content(), "html.parser")
+        for content in all_docs.values():
+            soup = BeautifulSoup(content, "html.parser")
             all_text.append(soup.get_text(separator="\n"))
         combined = _clean_text("\n\n".join(all_text))
         if combined:

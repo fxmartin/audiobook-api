@@ -57,7 +57,7 @@ async def startup():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     Path("data/cache").mkdir(parents=True, exist_ok=True)
     await jobs.init_db()
-    logger.info("Audiobook API started on port 8766")
+    logger.info("Audiobook API started on port 8767")
 
 
 @app.get("/health")
@@ -128,7 +128,7 @@ async def start_conversion(
 
     await jobs.create_job(job_id, filename, format, voice, language, use_clone=ref_audio_b64 is not None)
 
-    # Launch background conversion
+    # Launch background conversion (ref_text auto-transcribed via Whisper STT)
     task = asyncio.create_task(convert(job_id, file_path, voice, language, format, ref_audio_b64))
     _running_tasks[job_id] = task
     task.add_done_callback(lambda t: _running_tasks.pop(job_id, None))
@@ -184,6 +184,26 @@ async def download_job(job_id: str):
         media_type=media_type,
         filename=dl_filename,
     )
+
+
+@app.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Cancel a running job. Keeps cached chunks for future resumption."""
+    job = await jobs.get_job(job_id)
+    if not job:
+        raise HTTPException(404, f"Job not found: {job_id}")
+
+    if job["status"] in ("completed", "failed", "cancelled"):
+        return {"job_id": job_id, "status": job["status"], "message": "Job already finished"}
+
+    # Cancel the background task
+    task = _running_tasks.get(job_id)
+    if task and not task.done():
+        task.cancel()
+        logger.info("Cancelled running task for job %s", job_id)
+
+    await jobs.update_status(job_id, "cancelled")
+    return {"job_id": job_id, "status": "cancelled"}
 
 
 @app.delete("/jobs/{job_id}")
@@ -267,4 +287,4 @@ def _format_job(job: dict) -> dict:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8766)
+    uvicorn.run(app, host="0.0.0.0", port=8767)
